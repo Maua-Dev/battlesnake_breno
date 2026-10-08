@@ -6,24 +6,25 @@
 #  |________/(______/__|  |__| |____/\_____>______>___|__(______/__|__\_____>
 #
 # =============================================================================
-#  v2.0.0 — O QUE MUDOU EM RELAÇÃO À v1.1.0
+#  v2.1.0 — ALIMENTAÇÃO ESTRATÉGICA NA BUSCA 1v1 (sobre a v2.0.0)
 # =============================================================================
-#  1. BUSCA 1v1 (classe Search): minimax com poda alfa-beta e aprofundamento iterativo.
-#     Cada lance da árvore é um turno inteiro (eu + rival juntos, regras reais: comida,
-#     fome, hazard, parede, corpo, choque de cabeças). O rival joga o pior caso para mim.
-#     Com 3+ cobras continua a pontuação por componentes (a v1.1.0 inteira).
-#  2. AVALIAÇÃO DA BUSCA EM BITBOARD: o Voronoi (quem chega primeiro em cada casa) é feito
-#     com inteiros grandes do Python (operações em bloco, sem laços por casa). Isso torna a
-#     avaliação ~10x mais barata e é o que permite profundidade útil em Python puro.
-#  3. DIJKSTRA EM PONTOS DE VIDA para comida/fome na pontuação clássica: em mapas com
-#     hazard, cada casa de hazard custa 1 + dano (antes só se contavam passos).
-#  4. ORÇAMENTO DE TEMPO ADAPTATIVO: a busca encolhe se you.latency (rede + cálculo da
-#     jogada anterior) já estiver perto do timeout.
-#  5. DESEMPATE NA RAIZ SEM "FALSO EMPATE": a janela da raiz usa uma folga mínima para que
-#     valores iguais sejam exatos (alfa-beta puro devolve só um limite em jogadas cortadas).
-#  6. JOGADA ÚNICA = RESPOSTA IMEDIATA (não gasta tempo avaliando).
-#  7. ROBUSTEZ: valida coordenadas e o fallback agora considera TODOS os corpos e 'wrapped'.
+#  Diagnóstico: na busca, a comida valia no máximo ~3.5 pontos (7/(1+t)) contra 3-10
+#  pontos de território por jogada, não dependia de vida/fase/tamanho e quase não criava
+#  gradiente de aproximação. PHASE_MODS e a urgência de vida só afetavam o desempate.
+#  1. Valor de comida DINÂMICO dentro de Search.evaluate (interesse = base + (1-base)*urgência;
+#     base depende da abertura, do tamanho relativo e da escassez de comida).
+#  2. Qualidade por comida calculada UMA vez por jogada (hazard, beco, espaço depois de
+#     comer, custo em vida, risco de head-to-head) e reutilizada em todas as folhas.
+#  3. "Food commitment": a melhor comida segura e alcançável antes do rival ganha reforço,
+#     e a raiz dá um bônus por progresso real (potencial: aproximar +, afastar -, ciclo = 0).
+#  4. Recompensa de comer >= valor de ficar colado na comida (a cobra não "orbita" a comida).
+#  5. PHASE_MODS agora governa comida (s_food), progresso (s_commit), território e pressão.
+#  6. Anti-orbitação: memória curta das últimas cabeças; se repetir posições, sobe o interesse
+#     em comida e penaliza revisitar casas (pequeno e limitado).
+#  7. CORREÇÃO: empate por morte mútua valia 0.0 (= posição equilibrada) e a busca o escolhia
+#     (duas cobras iguais entrando juntas na mesma comida). Agora DRAW é bem negativo.
 #
+
 # Documentação: https://docs.battlesnake.com
 
 
@@ -80,6 +81,9 @@ WEIGHTS: dict[str, float] = {
     "hunt": 80.0,         # aproximação de cabeça de cobra menor (quando saudável)
     # --- tática de cauda ---
     "tail_follow": 120.0, # seguir a própria cauda quando o espaço está apertado
+    # --- busca 1v1 (escalados por PHASE_MODS) ---
+    "s_food": 50.0,       # pontos de uma comida segura, colada em mim, com interesse total
+    "s_commit": 6.0,      # pontos por passo de progresso rumo à comida comprometida (raiz)
 }
 
 # Limiares e fatores (não são "pesos", mas também são ajustáveis).
@@ -100,6 +104,28 @@ TUNING: dict[str, float] = {
     "tail_min_len": 8,          # só seguimos a cauda ativamente com corpo desse tamanho
     "opening_turns": 12,        # turnos considerados "abertura"
     "time_budget": 0.4,         # fração do timeout que podemos gastar calculando (pontuação)
+    "endgame_fill": 0.22,       # 1v1: corpos ocupando >= essa fração do tabuleiro = reta final
+}
+
+# Estratégia de comida na busca 1v1 (tudo que decide "quando vale crescer").
+FOOD: dict[str, float] = {
+    "base_open": 0.55,      # interesse mínimo em comida no turno 0 (decai até base_mid)
+    "base_mid": 0.30,       # interesse mínimo com vida cheia, tamanho parecido
+    "base_ahead": 0.12,     # idem quando já estou bem maior
+    "ahead_margin": 3,      # segmentos a mais para contar como "bem maior"
+    "behind_bonus": 0.12,   # +interesse se sou igual ou menor (crescer vence choques)
+    "scarce_bonus": 0.10,   # +interesse com poucas comidas no mapa
+    "early_turns": 30,      # turnos para o interesse de abertura decair até base_mid
+    "h_min": 9.0,           # alcance (passos) do valor de comida com vida folgada
+    "h_urgent": 20.0,       # alcance com vida crítica (comida distante passa a importar)
+    "deny": 0.55,           # fração do valor descontada quando o RIVAL leva a comida
+    "eat_extra": 0.10,      # comer vale (qualidade + extra) x pull: nunca menos que ficar colado
+    "commit_boost": 1.5,    # reforço da comida comprometida
+    "commit_min": 0.10,     # interesse x qualidade mínimos para comprometer
+    "space_checks": 4,      # quantas comidas (as mais próximas) checam o espaço depois de comer
+    "stall_min": 3,         # posições repetidas nas últimas jogadas = orbitando
+    "stall_bonus": 0.20,    # +interesse em comida quando orbitando
+    "revisit_pen": 1.5,     # pontos por revisitar uma casa recente (só orbitando; máx. 3x)
 }
 
 # Busca 1v1. Pesos da avaliação da busca: 1 ponto = 1 casa de território de vantagem.
@@ -108,21 +134,25 @@ SEARCH: dict[str, float] = {
     "cap_ms": 220.0,        # teto de tempo da busca
     "min_ms": 25.0,         # piso de tempo (mesmo com latência alta)
     "w_length": 3.0,        # por segmento a mais que a rival (ganha choques e território)
-    "w_food": 7.0,          # comida que chego antes do rival (decai com a distância)
-    "w_food_lost": 2.5,     # comida que o rival chega antes
     "w_starve": 400.0,      # morro de fome antes de alcançar qualquer comida
     "w_starve_margin": 6.0, # por turno de folga abaixo de 8 até a comida mais próxima
     "w_cramped": 6.0,       # por casa que falta para o território igualar meu tamanho
     "w_hazard": 20.0,       # cabeça dentro de hazard
 }
 WIN = 100000
+# Morte mútua (mesmo tamanho / dois na mesma casa). Antes valia 0.0, igual a uma posição equilibrada,
+# e a busca chegava a ESCOLHER o empate (ex.: duas cobras entrando juntas na mesma comida).
+# Agora é pior que qualquer posição viva (as notas heurísticas ficam bem abaixo de 10000 em
+# módulo) e melhor que uma derrota forçada: só aceitamos o empate se o resto for perder.
+DRAW = -(WIN // 10)
 ROOT_EPS = 1e-6
 
 # Multiplicadores por fase da partida (só altera o que for listado).
 PHASE_MODS: dict[str, dict[str, float]] = {
-    "opening": {"food": 1.3, "hunt": 0.3, "kill": 0.7},
+    "opening": {"food": 1.3, "hunt": 0.3, "kill": 0.7, "s_food": 1.35, "s_commit": 1.2},
     "midgame": {},
-    "endgame": {"hunt": 2.0, "territory": 1.3, "food": 0.8},  # 1v1: pressionar o adversário
+    # reta final do 1v1 (à frente em tamanho ou tabuleiro cheio): mais território e pressão
+    "endgame": {"hunt": 2.0, "territory": 1.3, "food": 0.8, "s_food": 0.9, "s_commit": 0.8},
 }
 
 
@@ -137,7 +167,7 @@ def info() -> dict:
         "color": "#8B0000",
         "head": "tiger-king",
         "tail": "hook",
-        "version": "2.0.0",
+        "version": "2.1.0",
     }
 
 
@@ -189,6 +219,8 @@ class Context:
     max_enemy_len: int = 0
     timeout_ms: int = 500
     latency: float = 0.0   # ms medidos pelo jogo na jogada anterior (rede + nosso cálculo)
+    recent: list = field(default_factory=list)   # últimas cabeças (a atual é a última)
+    stall: int = 0         # quantas posições se repetiram nessa janela (orbitando)
 
 
 @dataclass
@@ -257,6 +289,25 @@ def _latency_ms(you) -> float:
         return 0.0
 
 
+_HISTORY: dict = {}   # id da partida -> [(turno, cabeça)], janela curta (memória do anti-orbitação)
+
+
+def _track_heads(game_id, turn: int, head: Pt) -> list:
+    """Guarda as últimas cabeças desta partida (o servidor é sem estado, então guardamos aqui)."""
+    if game_id is None:
+        return [head]
+    hist = _HISTORY.get(game_id)
+    if hist is None:
+        if len(_HISTORY) >= 64:
+            _HISTORY.pop(next(iter(_HISTORY)))   # esquece a partida mais antiga
+        hist = _HISTORY[game_id] = []
+    if not hist or hist[-1][0] != turn:           # não conta duas vezes o mesmo turno
+        hist.append((turn, head))
+    if len(hist) > 14:
+        del hist[0]
+    return [h for _, h in hist]
+
+
 def build_context(state: GameState, started: float) -> Context:
     board = state.board
     you = state.you
@@ -314,6 +365,8 @@ def build_context(state: GameState, started: float) -> Context:
         latency=_latency_ms(you),
     )
     ctx.max_enemy_len = max((e.length for e in enemies), default=0)
+    ctx.recent = _track_heads(_dig(state, "game", "id"), ctx.turn, ctx.my_head)
+    ctx.stall = len(ctx.recent) - len(set(ctx.recent))
     ctx.phase = get_phase(ctx)
     mods = PHASE_MODS.get(ctx.phase, {})
     ctx.w = {k: v * mods.get(k, 1.0) for k, v in WEIGHTS.items()}
@@ -362,7 +415,12 @@ def get_phase(ctx: Context) -> str:
     if ctx.turn < TUNING["opening_turns"]:
         return "opening"
     if len(ctx.enemies) == 1:
-        return "endgame"
+        # Antes todo 1v1 pós-abertura era "endgame" (território x1.3, comida x0.8 o jogo inteiro).
+        # Agora só é reta final se estou claramente à frente ou o tabuleiro está cheio.
+        e = ctx.enemies[0]
+        crowded = (ctx.my_len + e.length) / (ctx.width * ctx.height) >= TUNING["endgame_fill"]
+        if ctx.my_len >= e.length + 2 or crowded:
+            return "endgame"
     return "midgame"
 
 
@@ -551,18 +609,44 @@ def evaluate_tail(ctx: Context, flood: FloodResult) -> float:
     return score
 
 
-def health_urgency(ctx: Context) -> float:
+def _urgency_at(ctx: Context, hp: float) -> float:
     """0 = vida confortável, 1 = crítica (interpolação linear entre os dois limiares)."""
     lo, hi = TUNING["health_critical"], TUNING["health_comfort"]
     if ctx.hazards:
         lo += TUNING["hazard_urgency_shift"]
         hi += TUNING["hazard_urgency_shift"]
-    h = ctx.my_health
-    if h <= lo:
+    if hp <= lo:
         return 1.0
-    if h >= hi:
+    if hp >= hi:
         return 0.0
-    return (hi - h) / (hi - lo)
+    return (hi - hp) / (hi - lo)
+
+
+def health_urgency(ctx: Context) -> float:
+    return _urgency_at(ctx, ctx.my_health)
+
+
+def food_interest(ctx: Context, hp: int, my_len: int, other_len: int, stall: int = 0):
+    """
+    Quanto a comida vale AGORA, de 0 a 1 (e a urgência de vida, também de 0 a 1).
+    interesse = base + (1 - base) * urgência. A base (o que sobra com a vida cheia) sobe na
+    abertura, quando estou igual/menor (crescer vence choques) e com pouca comida no mapa;
+    cai quando já estou bem maior; e sobe se estou orbitando sem comer.
+    """
+    need = _urgency_at(ctx, hp)
+    if my_len >= other_len + FOOD["ahead_margin"]:
+        base = FOOD["base_ahead"]
+    else:
+        early = max(0.0, 1.0 - ctx.turn / FOOD["early_turns"])
+        base = FOOD["base_mid"] + (FOOD["base_open"] - FOOD["base_mid"]) * early
+        if my_len <= other_len:
+            base += FOOD["behind_bonus"]
+        if len(ctx.food) <= TUNING["scarce_food"]:
+            base += FOOD["scarce_bonus"]   # (bem maior: não corre atrás de comida escassa)
+    if stall >= FOOD["stall_min"]:
+        base += FOOD["stall_bonus"]
+    base = min(base, 0.85)
+    return base + (1.0 - base) * need, need
 
 
 def evaluate_food(ctx: Context, routes: Routes) -> float:
@@ -807,6 +891,102 @@ class Search:
         self.max_depth = 0
         self.res_moves: list = []
         self.res_vals: list = []
+        self._prepare(ctx)
+
+    # ------------------------------------------------- preparação (1x por jogada)
+
+    def _prepare(self, ctx: Context) -> None:
+        """
+        Tudo que as folhas precisam saber sobre comida e fase, calculado UMA vez por jogada.
+        Dentro de evaluate() só há consultas a listas e contas simples (nada de varrer o tabuleiro).
+        """
+        rival = self.rival
+        self.root_l0, self.root_l1 = ctx.my_len, rival.length
+        self.terr = ctx.w["territory"] / WEIGHTS["territory"]   # fase: reta final = mais território
+        self.press = ctx.w["hunt"] / WEIGHTS["hunt"]            # fase: abertura 0.3x, reta final 2x
+        peak = ctx.w["s_food"]                                  # já multiplicado por PHASE_MODS
+        self.mix0, need0 = food_interest(ctx, ctx.my_health, ctx.my_len, rival.length, ctx.stall)
+        mix1, need1 = food_interest(ctx, rival.health, rival.length, ctx.my_len)
+        self.fs0 = peak * self.mix0                 # valor de uma comida segura colada em mim
+        self.fs1 = peak * mix1 * FOOD["deny"]       # quanto me custa o rival levar uma comida
+        span = FOOD["h_urgent"] - FOOD["h_min"]
+        self.inv0 = 1.0 / (FOOD["h_min"] + span * need0)   # 1/alcance: com fome, comida longe importa
+        self.inv1 = 1.0 / (FOOD["h_min"] + span * need1)
+        self.fq = [0.0] * self.V                    # qualidade (0..1.5) de cada comida atual
+        self.eat0, self.eat1 = {}, {}               # recompensa de comer (eu / rival), por casa
+        self.root_food = 0
+        self.commit = None                          # comida comprometida (Pt) ou None
+        self.commit_dist = None                     # distância (passos) de cada casa até ela
+        self.commit_d0 = 0                          # minha distância atual até ela
+        if ctx.food and not self.constrictor:
+            self._food_quality(ctx, need0)
+            for p in ctx.food:
+                idx = self._cell(p)
+                self.root_food |= self.bit[idx]
+                # comer vale um pouco MAIS que ficar colado na comida: sem isso a busca orbitaria
+                self.eat0[idx] = self.fs0 * (self.fq[idx] + FOOD["eat_extra"])
+                self.eat1[idx] = self.fs1 * (self.fq[idx] + FOOD["eat_extra"])
+
+    def _food_quality(self, ctx: Context, need0: float) -> None:
+        """
+        Qualidade de cada comida (1.0 = ótima; 0 = não vale/alcanço):
+          - não chego com a vida que tenho (custo em vida via Dijkstra se há hazard) -> 0
+          - em hazard sem necessidade, em corredor/canto, com pouco espaço depois de comer,
+            custando quase toda a vida, ou com rival MAIOR chegando logo atrás -> desconto
+        E escolhe a comida comprometida: segura, chego antes do rival e vale a pena.
+        Custo: 1 BFS da cabeça (+1 Dijkstra com hazard) + 1 BFS por comida próxima (até 4) + 1 BFS
+        da comida comprometida. Roda uma vez por jogada, não por folha.
+        """
+        d_me = _bfs(ctx, ctx.my_head, 0)
+        routes = dijkstra_routes(ctx, ctx.my_head, 0) if ctx.hazards else None
+        hp = ctx.my_health
+        reach = []
+        for f in ctx.food:
+            d = d_me.get(f)
+            if d is None:
+                continue
+            cost = routes.cost.get(f) if routes is not None else d   # custo em PONTOS DE VIDA
+            if cost is None:
+                continue
+            if f in ctx.hazards:
+                cost -= ctx.hazard_damage     # comer repõe a vida: o dano da própria casa não conta
+            if cost >= hp:
+                continue                      # morreria de fome a caminho
+            reach.append((d, cost, f))
+        reach.sort()
+
+        fq = self.fq
+        best_val, best = 0.0, None
+        for rank, (d, cost, f) in enumerate(reach):
+            q = 1.0
+            if f in ctx.hazards:
+                q *= TUNING["hazard_food"] + (1.0 - TUNING["hazard_food"]) * min(1.0, need0 / 0.8)
+            if routes is not None and cost > 0.6 * hp and need0 < 0.6:
+                q *= 0.5                      # gastaria quase toda a vida sem precisar
+            if _open_neighbors(ctx, f, d + 1) <= 1:
+                q *= TUNING["deadend_food"]   # canto/corredor
+            if rank < FOOD["space_checks"]:
+                space = len(_bfs(ctx, f, d))  # região acessível DEPOIS de comer (caudas liberando)
+                room = ctx.my_len + 1
+                if space < room:
+                    q *= 0.3
+                elif space < 2 * room:
+                    q *= 0.75
+            rt, rl = ctx.enemy_arrival.get(f, (None, 0))
+            margin = (rt - d) if rt is not None else 99     # >0: chego antes do rival
+            if margin == 1 and rl > ctx.my_len:
+                q *= 0.6                      # rival maior logo atrás: head-to-head ruim
+            fq[self._cell(f)] = q
+            if (margin > 0 or (margin == 0 and ctx.my_len > rl)) and q >= 0.5:
+                val = self.mix0 * q * max(0.0, 1.0 - (d - 1) * self.inv0)
+                if val > best_val:
+                    best_val, best = val, (f, d)
+
+        if best is not None and best_val >= FOOD["commit_min"]:
+            f, d = best
+            fq[self._cell(f)] *= FOOD["commit_boost"]
+            self.commit, self.commit_d0 = f, d
+            self.commit_dist = _bfs(ctx, f, 0)
 
     # ------------------------------------------------------------------ estado
 
@@ -972,7 +1152,11 @@ class Search:
         food = s.food
         constrictor = self.constrictor
         pc = _popcount
-        W_FOOD, W_FOOD_LOST = SEARCH["w_food"], SEARCH["w_food_lost"]
+        fq = self.fq
+        # depois que EU comi, as outras comidas valem menos (vida cheia); idem para o rival
+        fs0 = self.fs0 * (0.5 if l0 > self.root_l0 else 1.0)
+        fs1 = self.fs1 * (0.5 if l1 > self.root_l1 else 1.0)
+        inv0, inv1 = self.inv0, self.inv1
 
         h0b, h1b = bit[b0[0]], bit[b1[0]]
         claimed = h0b | h1b
@@ -1005,20 +1189,52 @@ class Search:
             c0 += pc(m0b)
             c1 += pc(m1b)
             if food:
-                a = pc(m0b & food)
-                b = pc(m1b & food)
-                if a:
-                    food_sc += W_FOOD * a / (1 + t)
-                if b:
-                    food_sc -= W_FOOD_LOST * b / (1 + t)
+                # comida que chego primeiro: valor = escala dinâmica x qualidade x proximidade
+                h0f = m0b & food
+                if h0f:
+                    g = 1.0 - (t - 1) * inv0
+                    if g > 0.0:
+                        k = fs0 * g
+                        while h0f:
+                            low = h0f & -h0f
+                            food_sc += k * fq[low.bit_length() - 1]
+                            h0f ^= low
+                h1f = m1b & food
+                if h1f:
+                    g = 1.0 - (t - 1) * inv1
+                    if g > 0.0:
+                        k = fs1 * g
+                        while h1f:
+                            low = h1f & -h1f
+                            food_sc -= k * fq[low.bit_length() - 1]
+                            h1f ^= low
             claimed |= n0 | n1
             f0, f1 = n0, n1
 
-        sc = (c0 - c1) + SEARCH["w_length"] * (l0 - l1) + food_sc
+        sc = self.terr * (c0 - c1) + SEARCH["w_length"] * (l0 - l1) + food_sc
+        if self.root_food:
+            # comida que SUMIU durante a linha foi comida: recompensa quem cresceu (valor médio)
+            eaten = self.root_food & ~food
+            if eaten:
+                g0, g1 = l0 - self.root_l0, l1 - self.root_l1
+                if g0 > 0 or g1 > 0:
+                    e0 = e1 = 0.0
+                    n = 0
+                    while eaten:
+                        low = eaten & -eaten
+                        idx = low.bit_length() - 1
+                        e0 += self.eat0[idx]
+                        e1 += self.eat1[idx]
+                        n += 1
+                        eaten ^= low
+                    if g0 > 0:
+                        sc += g0 * e0 / n
+                    if g1 > 0:
+                        sc -= g1 * e1 / n
         if c0 < l0:
             sc -= SEARCH["w_cramped"] * (l0 - c0)
         if c1 < l1:
-            sc += SEARCH["w_cramped"] * (l1 - c1)
+            sc += SEARCH["w_cramped"] * self.press * (l1 - c1)   # pressão: abertura fraca, reta final forte
 
         if not constrictor:
             for who in (0, 1):
@@ -1058,7 +1274,7 @@ class Search:
     def _child(self, s, m0, m1, depth, alpha, beta, ply) -> float:
         ns, d0, d1 = self.step(s, m0, m1)
         if d0:
-            return 0.0 if d1 else -(WIN - ply)   # os dois morrem = empate
+            return DRAW if d1 else -(WIN - ply)   # os dois morrem = empate (ruim, mas não é derrota)
         if d1:
             return WIN - ply                     # quanto mais cedo a vitória, melhor
         return self._ab(ns, depth - 1, alpha, beta, ply + 1)
@@ -1131,6 +1347,34 @@ def search_budget_ms(ctx: Context) -> float:
     return max(SEARCH["min_ms"], base - over)
 
 
+def _terminal(v: float) -> bool:
+    """Vitória/derrota forçada ou empate por morte mútua: esses valores nunca são ajustados."""
+    return abs(v) >= WIN - 200 or v == DRAW
+
+
+def _root_adjustments(ctx: Context, se: "Search", moves: list):
+    """
+    Bônus de PROGRESSO por jogada, na raiz (pequeno e limitado):
+      - rumo à comida comprometida: +1 se aproxima, -1 se afasta, 0 se lateral. É um potencial
+        (diferença de distância), então ir e voltar soma zero: não dá para "farmar" repetição.
+      - se estou orbitando (posições repetidas), revisitar uma casa recente custa um pouco.
+    Devolve ({jogada: bônus}, teto de diferença de valor em que o bônus pode decidir).
+    """
+    pts = ctx.w["s_commit"] * (0.35 + 0.65 * se.mix0)
+    out = {}
+    for m in moves:
+        pos = get_next_position(ctx, ctx.my_head, MOVE_ORDER[m])
+        bonus = 0.0
+        if se.commit_dist is not None and pos is not None:
+            da = se.commit_dist.get(pos)
+            progress = -1 if da is None else max(-1, min(1, se.commit_d0 - da))
+            bonus += pts * progress
+        if ctx.stall >= FOOD["stall_min"] and pos is not None:
+            bonus -= FOOD["revisit_pen"] * min(3, ctx.recent[:-1].count(pos))
+        out[m] = bonus
+    return out, 2.0 * pts + 3.0 * FOOD["revisit_pen"]
+
+
 def _search_choice(ctx: Context, possible: list, started: float):
     """Escolha por busca (1v1). Devolve (movimento, descrição) ou (None, '') se a busca não rendeu."""
     deadline = started + search_budget_ms(ctx) / 1000.0
@@ -1140,7 +1384,15 @@ def _search_choice(ctx: Context, possible: list, started: float):
     if not se.res_moves:
         return None, ""
     best_v = max(se.res_vals)
-    tied = [m for m, v in zip(se.res_moves, se.res_vals) if v >= best_v - 1e-9]
+    # Jogadas de valor parecido (dentro do teto) são decididas pelo progresso estratégico real.
+    # Vitória/derrota forçada e empate por morte mútua nunca são mexidos: sobrevivência manda.
+    adj, cap = ({}, 0.0) if _terminal(best_v) else _root_adjustments(ctx, se, se.res_moves)
+    scored = []
+    for m, v in zip(se.res_moves, se.res_vals):
+        bonus = adj.get(m, 0.0) if (v >= best_v - cap and not _terminal(v)) else 0.0
+        scored.append((v + bonus, m))
+    best_sc = max(sc for sc, _ in scored)
+    tied = [m for sc, m in scored if sc >= best_sc - 1e-9]
     pick = tied[0]
     if len(tied) > 1:  # empate: a pontuação clássica decide (se ainda houver tempo)
         guard = started + 0.40 * ctx.timeout_ms / 1000.0
@@ -1150,7 +1402,10 @@ def _search_choice(ctx: Context, possible: list, started: float):
             key = evaluate_move(ctx, name).score if time.perf_counter() < guard else quick_score(ctx, name)
             if best_key is None or key > best_key:
                 pick, best_key = m, key
-    return MOVE_ORDER[pick], "busca d=%d nós=%d v=%.0f" % (se.max_depth, se.nodes, best_v)
+    info = "busca d=%d nós=%d v=%.0f" % (se.max_depth, se.nodes, best_v)
+    if se.commit is not None:
+        info += " comida=%s" % (se.commit,)
+    return MOVE_ORDER[pick], info
 
 
 # --------------------------------------------------------------------------- #
