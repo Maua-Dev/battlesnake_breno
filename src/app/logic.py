@@ -6,6 +6,28 @@
 #  |________/(______/__|  |__| |____/\_____>______>___|__(______/__|__\_____>
 #
 # =============================================================================
+#  v2.2.0 — SOBREVIVÊNCIA ALÉM DO HORIZONTE E COMIDA PROPORCIONAL (sobre a v2.1.0)
+# =============================================================================
+#  Diagnóstico (medido em autojogo da v2.1.0: 45 de 80 partidas acabaram em colisão própria):
+#  - Search.step() bate com o motor oficial; a colisão própria NÃO vinha da simulação. Vinha de:
+#    a) Busca pessimista: com rival 1-2 maior, "todas as jogadas perdem" (o rival PODE forçar um
+#       choque) e a busca escolhia a morte mais tardia, muitas vezes um beco certo no próprio
+#       corpo, em vez da jogada que só perde se o rival jogar perfeito.
+#    b) Becos além do horizonte: as folhas só tinham w_cramped (6/casa), e uma comida valia até 72.
+#  - Comida: abertura empilhava base_open + behind + escassez + x1.35 (fase) + x1.5 (compromisso);
+#    proximidade somava TODAS as comidas e valia ~90% de comer; "espaço depois de comer" ignorava
+#    o próprio corpo no caminho até a comida.
+#  1. Checagem de sobrevivência SOLO na raiz (DFS: consigo viver K turnos sozinho?). Jogadas que
+#     sobrevivem e não perdem na busca têm prioridade; sem nenhuma, vence a maior "expectativa de
+#     vida" (beco certo < derrota que depende do rival jogar perfeito).
+#  2. Folhas: armadilha (região alcançável, com caudas liberando, menor que o corpo) custa caro;
+#     extensão de busca em corredores (1 saída ou menos).
+#  3. Comida: interesse por necessidade (vida) + estratégia (tamanho, abertura, escassez, tabuleiro
+#     cheio); proximidade = só a melhor comida e vale uma fração de comer; espaço depois de comer
+#     simula o corpo pelo caminho.
+#  4. Regras: hazard empilhado soma dano; cobra que morre de fome/parede sai antes das colisões.
+#
+# =============================================================================
 #  v2.1.0 — ALIMENTAÇÃO ESTRATÉGICA NA BUSCA 1v1 (sobre a v2.0.0)
 # =============================================================================
 #  Diagnóstico: na busca, a comida valia no máximo ~3.5 pontos (7/(1+t)) contra 3-10
@@ -108,23 +130,33 @@ TUNING: dict[str, float] = {
 }
 
 # Estratégia de comida na busca 1v1 (tudo que decide "quando vale crescer").
+# interesse = base + (1 - base) * urgência_de_vida; comer vale s_food * interesse * qualidade.
+# Com s_food = 50: vida cheia e tamanhos iguais ~18 pontos (18 casas de território); bem maior
+# ~5; vida crítica 50. Na v2.1.0 a abertura chegava a 72. (Valores escolhidos em benchmark.)
 FOOD: dict[str, float] = {
-    "base_open": 0.55,      # interesse mínimo em comida no turno 0 (decai até base_mid)
-    "base_mid": 0.30,       # interesse mínimo com vida cheia, tamanho parecido
-    "base_ahead": 0.12,     # idem quando já estou bem maior
+    "base_mid": 0.25,       # interesse mínimo com vida cheia (um pouco maior que o rival)
+    "tie_bonus": 0.12,      # +interesse com tamanho IGUAL (+1 transforma choque empatado em vitória)
+    "behind_bonus": 0.20,   # +interesse se sou MENOR (crescer é oportunidade estratégica)
+    "base_ahead": 0.10,     # interesse mínimo quando já estou bem maior (preservar > crescer)
     "ahead_margin": 3,      # segmentos a mais para contar como "bem maior"
-    "behind_bonus": 0.12,   # +interesse se sou igual ou menor (crescer vence choques)
+    "open_bonus": 0.25,     # +interesse no turno 0, decaindo até 0 em early_turns
+    "early_turns": 30,
     "scarce_bonus": 0.10,   # +interesse com poucas comidas no mapa
-    "early_turns": 30,      # turnos para o interesse de abertura decair até base_mid
+    "crowd_start": 0.20,    # fração do tabuleiro ocupada por corpos a partir da qual crescer pesa
+    "crowd_span": 0.25,     # ... e em quanto essa fração leva o desconto ao máximo
+    "crowd_cut": 0.4,       # desconto máximo da base com o tabuleiro cheio (crescer tira mobilidade)
+    "base_cap": 0.6,        # teto da base (a urgência de vida ainda leva o interesse até 1)
     "h_min": 9.0,           # alcance (passos) do valor de comida com vida folgada
     "h_urgent": 20.0,       # alcance com vida crítica (comida distante passa a importar)
+    "near": 0.5,            # ficar perto da MELHOR comida vale essa fração de comê-la (gradiente)
     "deny": 0.55,           # fração do valor descontada quando o RIVAL leva a comida
-    "eat_extra": 0.10,      # comer vale (qualidade + extra) x pull: nunca menos que ficar colado
-    "commit_boost": 1.5,    # reforço da comida comprometida
+    "commit_boost": 1.25,   # reforço da comida comprometida
     "commit_min": 0.10,     # interesse x qualidade mínimos para comprometer
-    "space_checks": 4,      # quantas comidas (as mais próximas) checam o espaço depois de comer
+    "space_checks": 6,      # quantas comidas (as mais próximas) simulam o corpo até comer
+    "trap_food": 0.1,       # qualidade se, depois de comer, a região é menor que o corpo
+    "tight_food": 0.7,      # ... se é menor que 2x o corpo
     "stall_min": 3,         # posições repetidas nas últimas jogadas = orbitando
-    "stall_bonus": 0.20,    # +interesse em comida quando orbitando
+    "stall_bonus": 0.15,    # +interesse em comida quando orbitando
     "revisit_pen": 1.5,     # pontos por revisitar uma casa recente (só orbitando; máx. 3x)
 }
 
@@ -137,7 +169,24 @@ SEARCH: dict[str, float] = {
     "w_starve": 400.0,      # morro de fome antes de alcançar qualquer comida
     "w_starve_margin": 6.0, # por turno de folga abaixo de 8 até a comida mais próxima
     "w_cramped": 6.0,       # por casa que falta para o território igualar meu tamanho
+    "w_trap": 80.0,         # região alcançável (caudas liberando) menor que o corpo: armadilha
+    "w_trap_cell": 12.0,    # ... mais isso por casa que falta (maior que qualquer comida)
+    "trap_rival": 0.6,      # fração do valor quando quem está preso é o rival
     "w_hazard": 20.0,       # cabeça dentro de hazard
+    "ext": 2,               # extensões por linha quando alguém tem <= 1 saída (corredores)
+}
+
+# Checagem de sobrevivência solo na raiz (1v1): "consigo viver K turnos se o rival não atrapalhar?"
+# O rival fica parado e só libera a cauda; isso é otimista para mim, então "não consigo" é quase
+# uma prova de morte (só escapo se o rival morrer antes).
+SAFETY: dict[str, float] = {
+    "horizon_min": 8,       # K mínimo (turnos)
+    "horizon_extra": 2,     # K = tamanho + extra ...
+    "horizon_max": 20,      # ... limitado a este teto
+    "nodes": 3000,          # nós por jogada; estourou = "não sei" (não veta a jogada)
+    "ms": 30.0,             # tempo total da checagem (ms)
+    "loss_slack": 1,        # derrota que depende do rival jogar perfeito no lance p vale
+                            # como sobreviver p + 1 + slack turnos (beco certo vale o que dura)
 }
 WIN = 100000
 # Morte mútua (mesmo tamanho / dois na mesma casa). Antes valia 0.0, igual a uma posição equilibrada,
@@ -148,11 +197,13 @@ DRAW = -(WIN // 10)
 ROOT_EPS = 1e-6
 
 # Multiplicadores por fase da partida (só altera o que for listado).
+# s_food/s_commit saíram daqui: abertura, tamanho e tabuleiro cheio já entram no interesse
+# (food_interest). Multiplicar de novo aqui contava a mesma coisa duas vezes.
 PHASE_MODS: dict[str, dict[str, float]] = {
-    "opening": {"food": 1.3, "hunt": 0.3, "kill": 0.7, "s_food": 1.35, "s_commit": 1.2},
+    "opening": {"food": 1.3, "hunt": 0.3, "kill": 0.7},
     "midgame": {},
     # reta final do 1v1 (à frente em tamanho ou tabuleiro cheio): mais território e pressão
-    "endgame": {"hunt": 2.0, "territory": 1.3, "food": 0.8, "s_food": 0.9, "s_commit": 0.8},
+    "endgame": {"hunt": 2.0, "territory": 1.3, "food": 0.8},
 }
 
 
@@ -167,7 +218,7 @@ def info() -> dict:
         "color": "#8B0000",
         "head": "tiger-king",
         "tail": "hook",
-        "version": "2.1.0",
+        "version": "2.2.0",
     }
 
 
@@ -221,6 +272,7 @@ class Context:
     latency: float = 0.0   # ms medidos pelo jogo na jogada anterior (rede + nosso cálculo)
     recent: list = field(default_factory=list)   # últimas cabeças (a atual é a última)
     stall: int = 0         # quantas posições se repetiram nessa janela (orbitando)
+    hazard_dmg: dict = field(default_factory=dict)  # casa -> dano (hazard empilhado soma)
 
 
 @dataclass
@@ -342,6 +394,11 @@ def build_context(state: GameState, started: float) -> Context:
     if not timeout_ms or timeout_ms <= 0:
         timeout_ms = 500
     constrictor = "constrictor" in ruleset  # cauda nunca sai do lugar, sem comida
+    # o motor aplica o dano uma vez por ENTRADA da lista: casa repetida = hazard empilhado
+    hazard_list = _cells(_dig(board, "hazards", default=[]), width, height)
+    hazard_dmg: dict = {}
+    for c in hazard_list:
+        hazard_dmg[c] = hazard_dmg.get(c, 0) + int(hazard_damage)
 
     ctx = Context(
         width=width,
@@ -358,11 +415,12 @@ def build_context(state: GameState, started: float) -> Context:
         my_health=_dig(you, "health", default=MAX_HEALTH),
         enemies=enemies,
         food=set(_cells(_dig(board, "food", default=[]), width, height)),
-        hazards=set(_cells(_dig(board, "hazards", default=[]), width, height)),
+        hazards=set(hazard_list),
         free_at=_build_free_at(bodies, constrictor),
         deadline=started + (timeout_ms / 1000.0) * TUNING["time_budget"],
         timeout_ms=int(timeout_ms),
         latency=_latency_ms(you),
+        hazard_dmg=hazard_dmg,
     )
     ctx.max_enemy_len = max((e.length for e in enemies), default=0)
     ctx.recent = _track_heads(_dig(state, "game", "id"), ctx.turn, ctx.my_head)
@@ -461,14 +519,18 @@ def _open_neighbors(ctx: Context, pos: Pt, turn: int) -> int:
 # MOVIMENTOS POSSÍVEIS / SEGURANÇA
 # --------------------------------------------------------------------------- #
 
+def hazard_damage_at(ctx: Context, pos: Pt) -> int:
+    """Dano de hazard ao entrar em 'pos' (somado se o hazard estiver empilhado)."""
+    if pos not in ctx.hazards:
+        return 0
+    return ctx.hazard_dmg.get(pos, ctx.hazard_damage)
+
+
 def health_after_move(ctx: Context, pos: Pt) -> int:
     """Vida após entrar em 'pos'. Comer devolve vida cheia (e não custa vida, ver /rules)."""
     if pos in ctx.food and not ctx.constrictor:
         return MAX_HEALTH
-    health = ctx.my_health - 1
-    if pos in ctx.hazards:
-        health -= ctx.hazard_damage
-    return health
+    return ctx.my_health - 1 - hazard_damage_at(ctx, pos)
 
 
 def is_position_safe(ctx: Context, pos, turn: int = 1) -> bool:
@@ -522,6 +584,23 @@ def _bfs(ctx: Context, start: Pt, start_turn: int) -> dict:
     return arrival
 
 
+def _bfs_tree(ctx: Context, start: Pt, start_turn: int) -> tuple:
+    """Igual a _bfs, mas também devolve de onde veio cada casa (para refazer o caminho)."""
+    arrival = {start: start_turn}
+    parent = {start: None}
+    queue = deque([start])
+    while queue:
+        cell = queue.popleft()
+        t = arrival[cell] + 1
+        for nxt in neighbors(ctx, cell):
+            if nxt in arrival or ctx.free_at.get(nxt, 0) > t:
+                continue
+            arrival[nxt] = t
+            parent[nxt] = cell
+            queue.append(nxt)
+    return arrival, parent
+
+
 def flood_fill(ctx: Context, start: Pt, start_turn: int = 1) -> FloodResult:
     """Espaço acessível a partir de 'start' (nossa cabeça após o movimento = turno 1)."""
     arrival = _bfs(ctx, start, start_turn)
@@ -535,7 +614,7 @@ def flood_fill(ctx: Context, start: Pt, start_turn: int = 1) -> FloodResult:
 
 def step_cost(ctx: Context, cell: Pt) -> int:
     """Vida gasta ao ENTRAR numa casa: 1 por turno + dano extra se for hazard."""
-    return 1 + (ctx.hazard_damage if cell in ctx.hazards else 0)
+    return 1 + hazard_damage_at(ctx, cell)
 
 
 def dijkstra_routes(ctx: Context, start: Pt, start_turn: int = 1) -> Routes:
@@ -629,23 +708,33 @@ def health_urgency(ctx: Context) -> float:
 def food_interest(ctx: Context, hp: int, my_len: int, other_len: int, stall: int = 0):
     """
     Quanto a comida vale AGORA, de 0 a 1 (e a urgência de vida, também de 0 a 1).
-    interesse = base + (1 - base) * urgência. A base (o que sobra com a vida cheia) sobe na
-    abertura, quando estou igual/menor (crescer vence choques) e com pouca comida no mapa;
-    cai quando já estou bem maior; e sobe se estou orbitando sem comer.
+    interesse = base + (1 - base) * urgência. A urgência (necessidade) vem só da vida. A base é o
+    valor ESTRATÉGICO de crescer com a vida cheia:
+      - bem maior: quase nada (preservar a região e explorar a vantagem vale mais);
+      - um pouco maior / igual / menor: cresce nessa ordem (+1 vira empate de choque em vitória);
+      - abertura e pouca comida no mapa: um pouco mais;
+      - tabuleiro cheio de corpos: menos (cada segmento a mais tira mobilidade);
+      - orbitando sem comer: um pouco mais (anti-orbitação).
     """
     need = _urgency_at(ctx, hp)
-    if my_len >= other_len + FOOD["ahead_margin"]:
+    diff = my_len - other_len
+    if diff >= FOOD["ahead_margin"]:
         base = FOOD["base_ahead"]
     else:
-        early = max(0.0, 1.0 - ctx.turn / FOOD["early_turns"])
-        base = FOOD["base_mid"] + (FOOD["base_open"] - FOOD["base_mid"]) * early
-        if my_len <= other_len:
+        base = FOOD["base_mid"]
+        if diff == 0:
+            base += FOOD["tie_bonus"]
+        elif diff < 0:
             base += FOOD["behind_bonus"]
+        base += FOOD["open_bonus"] * max(0.0, 1.0 - ctx.turn / FOOD["early_turns"])
         if len(ctx.food) <= TUNING["scarce_food"]:
             base += FOOD["scarce_bonus"]   # (bem maior: não corre atrás de comida escassa)
+    fill = (my_len + other_len) / (ctx.width * ctx.height)
+    crowd = min(1.0, max(0.0, (fill - FOOD["crowd_start"]) / FOOD["crowd_span"]))
+    base *= 1.0 - FOOD["crowd_cut"] * crowd
     if stall >= FOOD["stall_min"]:
         base += FOOD["stall_bonus"]
-    base = min(base, 0.85)
+    base = min(base, FOOD["base_cap"])
     return base + (1.0 - base) * need, need
 
 
@@ -878,11 +967,10 @@ class Search:
         self.V = self.W * self.H
         self.wrapped = ctx.wrapped
         self.constrictor = ctx.constrictor
-        self.hdmg = ctx.hazard_damage
         self.nbr, self.bit, self.full, self.expand = _geometry(self.W, self.H, self.wrapped)
-        self.hazard = [False] * self.V
-        for (x, y) in ctx.hazards:
-            self.hazard[y * self.W + x] = True
+        self.hazard = [0] * self.V             # dano ao entrar na casa (0 = sem hazard)
+        for p in ctx.hazards:
+            self.hazard[p[1] * self.W + p[0]] = hazard_damage_at(ctx, p)
         self.any_hazard = bool(ctx.hazards)
         self.rival = rival
         self.my_len0 = ctx.my_len
@@ -907,8 +995,8 @@ class Search:
         peak = ctx.w["s_food"]                                  # já multiplicado por PHASE_MODS
         self.mix0, need0 = food_interest(ctx, ctx.my_health, ctx.my_len, rival.length, ctx.stall)
         mix1, need1 = food_interest(ctx, rival.health, rival.length, ctx.my_len)
-        self.fs0 = peak * self.mix0                 # valor de uma comida segura colada em mim
-        self.fs1 = peak * mix1 * FOOD["deny"]       # quanto me custa o rival levar uma comida
+        self.fs0 = peak * self.mix0                 # valor de COMER uma comida de qualidade 1
+        self.fs1 = peak * mix1 * FOOD["deny"]       # quanto me custa o rival comer uma
         span = FOOD["h_urgent"] - FOOD["h_min"]
         self.inv0 = 1.0 / (FOOD["h_min"] + span * need0)   # 1/alcance: com fome, comida longe importa
         self.inv1 = 1.0 / (FOOD["h_min"] + span * need1)
@@ -923,21 +1011,55 @@ class Search:
             for p in ctx.food:
                 idx = self._cell(p)
                 self.root_food |= self.bit[idx]
-                # comer vale um pouco MAIS que ficar colado na comida: sem isso a busca orbitaria
-                self.eat0[idx] = self.fs0 * (self.fq[idx] + FOOD["eat_extra"])
-                self.eat1[idx] = self.fs1 * (self.fq[idx] + FOOD["eat_extra"])
+                # comer vale o valor cheio; ficar perto vale só FOOD["near"] disso (não orbita)
+                self.eat0[idx] = self.fs0 * self.fq[idx]
+                self.eat1[idx] = self.fs1 * self.fq[idx]
+
+    def _after_eating(self, ctx: Context, f: Pt, d: int, parent: dict) -> tuple:
+        """
+        Simula meu corpo andando pelo caminho mais curto até a comida 'f' (d passos) e comendo.
+        Devolve (casas alcançáveis depois de comer, saídas livres da comida no turno seguinte).
+        O corpo deixado no caminho bloqueia a volta: na v2.1.0 o corredor por onde eu vim contava
+        como espaço livre e uma comida no fundo de um beco parecia segura.
+        """
+        trail = [f]
+        while trail[-1] != ctx.my_head:
+            trail.append(parent[trail[-1]])
+        L = ctx.my_len
+        body = [self._cell(p) for p in (trail + ctx.my_body[1:])[:L]]
+        body.append(body[-1])                 # comeu: a cauda fica um turno a mais
+        pm = [0]
+        m = 0
+        for c in body:
+            m |= self.bit[c]
+            pm.append(m)
+        rb = [self._cell(p) for p in self.rival.body]
+        pr = [0]
+        m = 0
+        for c in rb:
+            m |= self.bit[c]
+            pr.append(m)
+        la, lb = len(body), len(rb) - d       # o rival já andou d turnos (cauda liberando)
+        head = self._cell(f)
+        kb = lb - 1
+        blocked1 = pm[la - 1] | (pr[kb] if kb > 0 else 0)
+        exits = _popcount(self.expand(self.bit[head]) & self.full & ~blocked1)
+        room = self._room(head, pm, la, pr, lb, 2 * (L + 1))
+        return room, exits
 
     def _food_quality(self, ctx: Context, need0: float) -> None:
         """
         Qualidade de cada comida (1.0 = ótima; 0 = não vale/alcanço):
           - não chego com a vida que tenho (custo em vida via Dijkstra se há hazard) -> 0
+          - depois de comer (corpo simulado pelo caminho) a região é menor que o corpo -> quase 0
           - em hazard sem necessidade, em corredor/canto, com pouco espaço depois de comer,
-            custando quase toda a vida, ou com rival MAIOR chegando logo atrás -> desconto
+            custando quase toda a vida, ou com rival maior/igual chegando logo atrás -> desconto
+            (corredor e choque pesam menos quando a vida está crítica; a armadilha não)
         E escolhe a comida comprometida: segura, chego antes do rival e vale a pena.
-        Custo: 1 BFS da cabeça (+1 Dijkstra com hazard) + 1 BFS por comida próxima (até 4) + 1 BFS
-        da comida comprometida. Roda uma vez por jogada, não por folha.
+        Custo: 1 BFS da cabeça (+1 Dijkstra com hazard) + 1 simulação em bitboard por comida
+        próxima (até space_checks) + 1 BFS da comida comprometida. Uma vez por jogada.
         """
-        d_me = _bfs(ctx, ctx.my_head, 0)
+        d_me, parent = _bfs_tree(ctx, ctx.my_head, 0)
         routes = dijkstra_routes(ctx, ctx.my_head, 0) if ctx.hazards else None
         hp = ctx.my_health
         reach = []
@@ -948,14 +1070,15 @@ class Search:
             cost = routes.cost.get(f) if routes is not None else d   # custo em PONTOS DE VIDA
             if cost is None:
                 continue
-            if f in ctx.hazards:
-                cost -= ctx.hazard_damage     # comer repõe a vida: o dano da própria casa não conta
+            cost -= hazard_damage_at(ctx, f)  # comer repõe a vida: o dano da própria casa não conta
             if cost >= hp:
                 continue                      # morreria de fome a caminho
             reach.append((d, cost, f))
         reach.sort()
 
         fq = self.fq
+        room_need = ctx.my_len + 1
+        soft = 0.5 * need0                    # com fome, riscos "táticos" pesam menos
         best_val, best = 0.0, None
         for rank, (d, cost, f) in enumerate(reach):
             q = 1.0
@@ -963,19 +1086,26 @@ class Search:
                 q *= TUNING["hazard_food"] + (1.0 - TUNING["hazard_food"]) * min(1.0, need0 / 0.8)
             if routes is not None and cost > 0.6 * hp and need0 < 0.6:
                 q *= 0.5                      # gastaria quase toda a vida sem precisar
-            if _open_neighbors(ctx, f, d + 1) <= 1:
-                q *= TUNING["deadend_food"]   # canto/corredor
-            if rank < FOOD["space_checks"]:
-                space = len(_bfs(ctx, f, d))  # região acessível DEPOIS de comer (caudas liberando)
-                room = ctx.my_len + 1
-                if space < room:
-                    q *= 0.3
-                elif space < 2 * room:
-                    q *= 0.75
             rt, rl = ctx.enemy_arrival.get(f, (None, 0))
             margin = (rt - d) if rt is not None else 99     # >0: chego antes do rival
-            if margin == 1 and rl > ctx.my_len:
-                q *= 0.6                      # rival maior logo atrás: head-to-head ruim
+            tight = False
+            if rank < FOOD["space_checks"]:
+                room, exits = self._after_eating(ctx, f, d, parent)
+                if room < room_need:
+                    q *= FOOD["trap_food"]    # comer = ficar preso (a fome não muda isso)
+                elif room < 2 * room_need:
+                    q *= FOOD["tight_food"]
+                    tight = True
+            else:
+                exits = _open_neighbors(ctx, f, d + 1)
+            if exits <= 1 and (tight or margin <= 2):
+                # canto/corredor com uma saída só é perigoso se o rival pode fechá-la a tempo
+                dead = TUNING["deadend_food"]
+                q *= dead + (1.0 - dead) * soft
+            if margin == 1 and rl >= ctx.my_len:
+                # rival maior (perco o choque) ou igual (morremos os dois) logo atrás
+                hit = 0.6 if rl > ctx.my_len else 0.8
+                q *= hit + (1.0 - hit) * soft
             fq[self._cell(f)] = q
             if (margin > 0 or (margin == 0 and ctx.my_len > rl)) and q >= 0.5:
                 val = self.mix0 * q * max(0.0, 1.0 - (d - 1) * self.inv0)
@@ -1038,23 +1168,34 @@ class Search:
             nh0, nh1 = s.h0 - 1, s.h1 - 1
             e0 = n0 >= 0 and bool(food & bit[n0])
             e1 = n1 >= 0 and bool(food & bit[n1])
-            if n0 >= 0 and self.hazard[n0]:
-                nh0 -= self.hdmg
-            if n1 >= 0 and self.hazard[n1]:
-                nh1 -= self.hdmg
+            if n0 >= 0:
+                nh0 -= self.hazard[n0]
+            if n1 >= 0:
+                nh1 -= self.hazard[n1]
             if e0:
                 nh0 = MAX_HEALTH
             if e1:
                 nh1 = MAX_HEALTH
             g0, g1 = int(e0), int(e1)
-        d0 = n0 < 0 or nh0 <= 0
-        d1 = n1 < 0 or nh1 <= 0
+        # o motor elimina primeiro quem saiu do tabuleiro ou zerou a vida; só as que sobraram
+        # colidem (o corpo de quem já saiu não mata ninguém, e não há choque de cabeças com ela)
+        out0 = n0 < 0 or nh0 <= 0
+        out1 = n1 < 0 or nh1 <= 0
+        d0, d1 = out0, out1
         occ = s.occ
-        if not d0 and occ & bit[n0]:
-            d0 = True
-        if not d1 and occ & bit[n1]:
-            d1 = True
-        if n0 == n1 and n0 >= 0:  # choque de cabeças: o menor morre, igual morrem os dois
+        if not out0 and occ & bit[n0]:
+            if out1:   # só o meu próprio corpo conta
+                own = s.pm0[-1] if self.constrictor else s.pm0[len(s.b0) - 1]
+                d0 = bool(own & bit[n0])
+            else:
+                d0 = True
+        if not out1 and occ & bit[n1]:
+            if out0:
+                own = s.pm1[-1] if self.constrictor else s.pm1[len(s.b1) - 1]
+                d1 = bool(own & bit[n1])
+            else:
+                d1 = True
+        if n0 == n1 and not out0 and not out1:  # choque de cabeças: o menor morre, igual os dois
             l0 = len(s.b0) + g0
             l1 = len(s.b1) + g1
             if l0 <= l1:
@@ -1098,6 +1239,34 @@ class Search:
         k1 = len(s.b1) - t
         return (s.pm0[k0] if k0 > 0 else 0) | (s.pm1[k1] if k1 > 0 else 0)
 
+    def _room(self, head: int, pa: list, la: int, pb: list, lb: int, need: int) -> int:
+        """
+        Casas que consigo alcançar a partir de 'head' (sem contar a cabeça), com os corpos
+        liberando no tempo: segmento i de um corpo de tamanho L (prefixos pa/pb) sai no passo L - i.
+        Diferente do Voronoi, não disputa casas com o rival: mede SE CABE, não de quem é.
+        É um BFS de fronteira (chegada mais cedo por caminho direto): a cobra não pode parar
+        esperando uma casa liberar, e num corredor o próprio corpo fecha a volta. Seguir a cauda
+        funciona sozinho (cada segmento libera um passo depois do anterior, colado nele).
+        Para assim que chega a 'need' casas.
+        """
+        bit, expand, full = self.bit, self.expand, self.full
+        seen = front = bit[head]
+        cnt = t = 0
+        const = (pa[-1] | pb[-1]) if self.constrictor else 0
+        while front:
+            t += 1
+            if self.constrictor:
+                blocked = const
+            else:
+                ka, kb = la - t, lb - t
+                blocked = (pa[ka] if ka > 0 else 0) | (pb[kb] if kb > 0 else 0)
+            front = expand(front) & full & ~(seen | blocked)
+            seen |= front
+            cnt += _popcount(front)
+            if cnt >= need:
+                break
+        return cnt
+
     def _food_dist(self, s: _St, head: int, limit: int) -> int:
         """Menor distância (em turnos) até alguma comida, ignorando o rival. -1 se não houver."""
         seen = front = self.bit[head]
@@ -1131,17 +1300,45 @@ class Search:
             if cost > best.get(c, INF):
                 continue
             if c != head and food & bit[c]:
-                return cost - (self.hdmg if self.hazard[c] else 0)
+                return cost - self.hazard[c]
             if cost >= hp:
                 continue
             for n in self.nbr[c]:
                 if n < 0 or free_t.get(n, 0) > steps + 1:
                     continue
-                nc = cost + 1 + (self.hdmg if self.hazard[n] else 0)
+                nc = cost + 1 + self.hazard[n]
                 if nc < best.get(n, INF):
                     best[n] = nc
                     heapq.heappush(heap, (nc, steps + 1, n))
         return -1
+
+    @staticmethod
+    def _eaten_value(eaten: int, own_body: int, other_body: int, grew: int, eat: dict) -> float:
+        """
+        Valor das comidas que UMA cobra comeu na linha (cresceu 'grew' segmentos). A comida que
+        ainda está sob o corpo dela foi dela; a que não está sob corpo nenhum (a cauda já passou)
+        entra pela média, até completar o quanto cresceu. (Na v2.1.0 cada cobra recebia a média
+        de TODAS as comidas sumidas, inclusive as que o rival comeu.)
+        """
+        v, k = 0.0, 0
+        m = eaten & own_body
+        while m:
+            low = m & -m
+            v += eat[low.bit_length() - 1]
+            k += 1
+            m ^= low
+        if k > grew:
+            return v * grew / k
+        rest = eaten & ~(own_body | other_body)
+        if k < grew and rest:
+            tot, n = 0.0, 0
+            while rest:
+                low = rest & -rest
+                tot += eat[low.bit_length() - 1]
+                n += 1
+                rest ^= low
+            v += (grew - k) * tot / n
+        return v
 
     def evaluate(self, s: _St) -> float:
         """Nota do estado do ponto de vista da cobra 0 (eu): positivo = bom para mim."""
@@ -1153,16 +1350,18 @@ class Search:
         constrictor = self.constrictor
         pc = _popcount
         fq = self.fq
-        # depois que EU comi, as outras comidas valem menos (vida cheia); idem para o rival
-        fs0 = self.fs0 * (0.5 if l0 > self.root_l0 else 1.0)
-        fs1 = self.fs1 * (0.5 if l1 > self.root_l1 else 1.0)
+        # perto da comida vale só uma fração de comer (gradiente); depois que EU comi, as outras
+        # comidas valem menos (vida cheia); idem para o rival
+        near = FOOD["near"]
+        fs0 = self.fs0 * near * (0.5 if l0 > self.root_l0 else 1.0)
+        fs1 = self.fs1 * near * (0.5 if l1 > self.root_l1 else 1.0)
         inv0, inv1 = self.inv0, self.inv1
 
         h0b, h1b = bit[b0[0]], bit[b1[0]]
         claimed = h0b | h1b
         f0, f1 = h0b, h1b
         c0 = c1 = 0
-        food_sc = 0.0
+        best0 = best1 = 0.0      # só a MELHOR comida de cada um conta (não a soma de todas)
         t = 0
         # Voronoi: a cada passo cada cobra expande a fronteira; casa alcançada por uma só é dela;
         # disputada (mesmo turno) fica com a MAIOR (a menor perderia o choque); igual = de ninguém.
@@ -1197,7 +1396,9 @@ class Search:
                         k = fs0 * g
                         while h0f:
                             low = h0f & -h0f
-                            food_sc += k * fq[low.bit_length() - 1]
+                            v = k * fq[low.bit_length() - 1]
+                            if v > best0:
+                                best0 = v
                             h0f ^= low
                 h1f = m1b & food
                 if h1f:
@@ -1206,35 +1407,34 @@ class Search:
                         k = fs1 * g
                         while h1f:
                             low = h1f & -h1f
-                            food_sc -= k * fq[low.bit_length() - 1]
+                            v = k * fq[low.bit_length() - 1]
+                            if v > best1:
+                                best1 = v
                             h1f ^= low
             claimed |= n0 | n1
             f0, f1 = n0, n1
 
-        sc = self.terr * (c0 - c1) + SEARCH["w_length"] * (l0 - l1) + food_sc
+        sc = self.terr * (c0 - c1) + SEARCH["w_length"] * (l0 - l1) + best0 - best1
         if self.root_food:
-            # comida que SUMIU durante a linha foi comida: recompensa quem cresceu (valor médio)
+            # comida que SUMIU durante a linha foi comida: cada um recebe o valor das que comeu
             eaten = self.root_food & ~food
             if eaten:
                 g0, g1 = l0 - self.root_l0, l1 - self.root_l1
-                if g0 > 0 or g1 > 0:
-                    e0 = e1 = 0.0
-                    n = 0
-                    while eaten:
-                        low = eaten & -eaten
-                        idx = low.bit_length() - 1
-                        e0 += self.eat0[idx]
-                        e1 += self.eat1[idx]
-                        n += 1
-                        eaten ^= low
-                    if g0 > 0:
-                        sc += g0 * e0 / n
-                    if g1 > 0:
-                        sc -= g1 * e1 / n
+                if g0 > 0:
+                    sc += self._eaten_value(eaten, pm0[l0], pm1[l1], g0, self.eat0)
+                if g1 > 0:
+                    sc -= self._eaten_value(eaten, pm1[l1], pm0[l0], g1, self.eat1)
         if c0 < l0:
             sc -= SEARCH["w_cramped"] * (l0 - c0)
+            # território pequeno: ainda CABE (região alcançável, sem disputa, caudas liberando)?
+            r0 = self._room(b0[0], pm0, l0, pm1, l1, l0)
+            if r0 < l0:
+                sc -= SEARCH["w_trap"] + SEARCH["w_trap_cell"] * (l0 - r0)
         if c1 < l1:
             sc += SEARCH["w_cramped"] * self.press * (l1 - c1)   # pressão: abertura fraca, reta final forte
+            r1 = self._room(b1[0], pm1, l1, pm0, l0, l1)
+            if r1 < l1:
+                sc += SEARCH["trap_rival"] * (SEARCH["w_trap"] + SEARCH["w_trap_cell"] * (l1 - r1))
 
         if not constrictor:
             for who in (0, 1):
@@ -1271,25 +1471,41 @@ class Search:
         if (self.nodes & 7) == 0 and time.perf_counter() > self.deadline:
             raise _SearchTimeout()
 
-    def _child(self, s, m0, m1, depth, alpha, beta, ply) -> float:
+    def _child(self, s, m0, m1, depth, alpha, beta, ply, ext=0) -> float:
         ns, d0, d1 = self.step(s, m0, m1)
         if d0:
             return DRAW if d1 else -(WIN - ply)   # os dois morrem = empate (ruim, mas não é derrota)
         if d1:
             return WIN - ply                     # quanto mais cedo a vitória, melhor
-        return self._ab(ns, depth - 1, alpha, beta, ply + 1)
+        return self._ab(ns, depth - 1, alpha, beta, ply + 1, ext)
 
-    def _ab(self, s: _St, depth: int, alpha: float, beta: float, ply: int) -> float:
+    def _narrow(self, s: _St) -> bool:
+        """Alguém tem no máximo 1 saída: a folha é instável (corredor, cerco, beco)."""
+        occ, bit = s.occ, self.bit
+        for head in (s.b0[0], s.b1[0]):
+            free = 0
+            for n in self.nbr[head]:
+                if n >= 0 and not (occ & bit[n]):
+                    free += 1
+            if free <= 1:
+                return True
+        return False
+
+    def _ab(self, s: _St, depth: int, alpha: float, beta: float, ply: int, ext: int = 0) -> float:
         self._tick()
         if depth <= 0:
-            return self.evaluate(s)
+            # extensão: em corredor/cerco a folha mente (a morte ou a fuga está a 1 lance);
+            # olha mais um lance, no máximo 'ext' vezes por linha (barato: pouca ramificação)
+            if ext <= 0 or not self._narrow(s):
+                return self.evaluate(s)
+            depth, ext = 1, ext - 1
         mine = self.moves(s, 0)
         theirs = self.moves(s, 1)
         best = -10.0 * WIN
         for m0 in mine:
             worst = 10.0 * WIN
             for m1 in theirs:
-                v = self._child(s, m0, m1, depth, alpha, min(beta, worst), ply)
+                v = self._child(s, m0, m1, depth, alpha, min(beta, worst), ply, ext)
                 if v < worst:
                     worst = v
                 if worst <= alpha:
@@ -1307,6 +1523,7 @@ class Search:
         self.deadline = deadline
         self.res_moves, self.res_vals = [], []
         theirs = self.moves(s, 1)
+        ext = int(SEARCH["ext"])
         for depth in range(1, 60):
             mv, val = [], []
             alpha = -10.0 * WIN
@@ -1315,7 +1532,7 @@ class Search:
                     worst = 10.0 * WIN
                     for m1 in theirs:
                         # folga ROOT_EPS: jogadas de valor IGUAL ao melhor saem exatas (sem falso empate)
-                        v = self._child(s, m0, m1, depth, alpha - ROOT_EPS, worst, 0)
+                        v = self._child(s, m0, m1, depth, alpha - ROOT_EPS, worst, 0, ext)
                         if v < worst:
                             worst = v
                         if worst <= alpha - ROOT_EPS:
@@ -1352,6 +1569,134 @@ def _terminal(v: float) -> bool:
     return abs(v) >= WIN - 200 or v == DRAW
 
 
+# --------------------------------------------------------------------------- #
+# SOBREVIVÊNCIA SOLO (1v1): consigo viver K turnos se o rival não atrapalhar?
+# --------------------------------------------------------------------------- #
+
+class _SoloBudget(Exception):
+    """A checagem solo estourou nós ou tempo (o resultado vira "não sei")."""
+
+
+def solo_horizon(ctx: Context) -> int:
+    """K: turnos que uma jogada precisa garantir. Viver ~tamanho turnos = o corpo atual já saiu."""
+    k = max(SAFETY["horizon_min"], ctx.my_len + SAFETY["horizon_extra"])
+    return int(min(SAFETY["horizon_max"], k))
+
+
+def solo_survival(ctx: Context, moves: list, deadline: float) -> dict:
+    """
+    Para cada jogada: quantos turnos (até K) consigo sobreviver SOZINHO depois dela. Os outros
+    corpos ficam parados e só liberam a cauda (free_at); a minha cobra segue as regras reais
+    (cauda sai, comer cresce e enche a vida, hazard e fome tiram vida).
+    O rival só pode piorar a minha situação (a não ser morrendo), então "< K" é um beco quase
+    certo, mesmo que a morte esteja além do horizonte da busca. DFS com a heurística de
+    Warnsdorff (casa com menos saídas primeiro: preenche o espaço sem se fechar) acha caminhos
+    longos rápido. Estouro de nós/tempo devolve K: "não sei" nunca veta uma jogada.
+    """
+    W = ctx.width
+    nbr, bit, _, _ = _geometry(W, ctx.height, ctx.wrapped)
+    K = solo_horizon(ctx)
+    constrictor = ctx.constrictor
+
+    def cell(p: Pt) -> int:
+        return p[1] * W + p[0]
+
+    others = [0] * (K + 2)   # casas dos OUTROS ainda ocupadas depois do meu t-ésimo movimento
+    for p, ft in _build_free_at([e.body for e in ctx.enemies], constrictor).items():
+        b = bit[cell(p)]
+        for t in range(min(ft, K + 2)):
+            others[t] |= b
+    hz = [0] * (W * ctx.height)
+    for p in ctx.hazards:
+        hz[cell(p)] = hazard_damage_at(ctx, p)
+    food0 = 0
+    if not constrictor:
+        for p in ctx.food:
+            food0 |= bit[cell(p)]
+
+    def children(body, m, hp, food, t):
+        """Estados depois do (t+1)-ésimo movimento, casa com menos saídas primeiro."""
+        tail = body[-1]
+        occ = m if constrictor or (len(body) > 1 and body[-2] == tail) else m & ~bit[tail]
+        block = occ | others[t + 1]
+        nxt_others = others[min(t + 2, K + 1)]
+        out = []
+        for n in nbr[body[0]]:
+            if n < 0 or block & bit[n]:
+                continue
+            eat = not constrictor and bool(food & bit[n])
+            if constrictor:
+                nh, nb = hp, (n,) + body
+            else:
+                nh = MAX_HEALTH if eat else hp - 1 - hz[n]
+                if nh <= 0:
+                    continue
+                nb = (n,) + body[:-1]
+                if eat:
+                    nb += (nb[-1],)
+            nm = occ | bit[n]
+            nblock = nm | nxt_others
+            exits = sum(1 for c in nbr[n] if c >= 0 and not nblock & bit[c])
+            out.append((exits == 0, exits, nb, nm, nh, food & ~bit[n] if eat else food))
+        out.sort(key=lambda c: (c[0], c[1]))
+        return out
+
+    memo: dict = {}
+    nodes = [0]
+
+    def dfs(body, m, hp, food, t):
+        if t >= K:
+            return K
+        key = (body, t, min(hp, K), food)
+        if key in memo:
+            return memo[key]
+        nodes[0] += 1
+        if nodes[0] > SAFETY["nodes"] or ((nodes[0] & 63) == 0 and time.perf_counter() > deadline):
+            raise _SoloBudget()
+        best = t
+        for _, _, nb, nm, nh, nf in children(body, m, hp, food, t):
+            r = dfs(nb, nm, nh, nf, t + 1)
+            if r > best:
+                best = r
+                if best >= K:
+                    break
+        memo[key] = best
+        return best
+
+    body0 = tuple(cell(p) for p in ctx.my_body)
+    m0 = 0
+    for c in body0:
+        m0 |= bit[c]
+    first = {ch[2][0]: ch for ch in children(body0, m0, ctx.my_health, food0, 0)}
+    result = {}
+    for move in moves:
+        pos = get_next_position(ctx, ctx.my_head, move)
+        ch = first.get(cell(pos)) if pos is not None else None
+        if ch is None:
+            result[move] = 0
+            continue
+        nodes[0] = 0
+        try:
+            result[move] = K if time.perf_counter() > deadline else dfs(ch[2], ch[3], ch[4], ch[5], 1)
+        except _SoloBudget:
+            result[move] = K
+    return result
+
+
+def _life(v: float, solo: int) -> int:
+    """
+    Expectativa de vida (turnos) de uma jogada que a busca não aprova. Beco solo vale o que dura;
+    derrota no lance p que depende do rival jogar perfeito (a busca é pessimista: ele "vê" a minha
+    jogada antes de mexer) vale p + 1 + loss_slack. Empate por morte mútua vale como derrota no lance 0.
+    """
+    if v == DRAW:
+        return min(solo, 1 + int(SAFETY["loss_slack"]))
+    if v <= -(WIN - 200):
+        p = max(0, int(round(v + WIN)))
+        return min(solo, p + 1 + int(SAFETY["loss_slack"]))
+    return solo
+
+
 def _root_adjustments(ctx: Context, se: "Search", moves: list):
     """
     Bônus de PROGRESSO por jogada, na raiz (pequeno e limitado):
@@ -1375,20 +1720,40 @@ def _root_adjustments(ctx: Context, se: "Search", moves: list):
     return out, 2.0 * pts + 3.0 * FOOD["revisit_pen"]
 
 
-def _search_choice(ctx: Context, possible: list, started: float):
-    """Escolha por busca (1v1). Devolve (movimento, descrição) ou (None, '') se a busca não rendeu."""
+def _search_choice(ctx: Context, possible: list, started: float, surv: dict = None):
+    """
+    Escolha por busca (1v1). Devolve (movimento, descrição) ou (None, '') se a busca não rendeu.
+    'surv' (jogada -> turnos de sobrevivência solo) define quem pode ser escolhido:
+      1. vitória forçada;
+      2. senão, só as jogadas VIÁVEIS: sobrevivem K turnos sozinhas e a busca não vê derrota;
+      3. senão, a maior expectativa de vida (_life). Na v2.1.0, com rival maior, "todas perdem"
+         levava à morte mais tardia, quase sempre um beco certo no próprio corpo.
+    """
     deadline = started + search_budget_ms(ctx) / 1000.0
     order = [MOVE_ORDER.index(m) for m in sort_by_quick_score(ctx, possible)]
     se = Search(ctx, ctx.enemies[0])
     se.search(se.make_state(ctx), order, deadline)
     if not se.res_moves:
         return None, ""
-    best_v = max(se.res_vals)
+    vals = dict(zip(se.res_moves, se.res_vals))
+    K = solo_horizon(ctx)
+    solo = {MOVE_ORDER.index(m): s for m, s in (surv or {}).items()}
+    note = ""
+    pool = [m for m in se.res_moves if vals[m] >= WIN - 200]
+    if not pool:
+        pool = [m for m in se.res_moves if solo.get(m, K) >= K and not _terminal(vals[m])]
+    if not pool:
+        life = {m: _life(vals[m], solo.get(m, K)) for m in se.res_moves}
+        top = max(life.values())
+        pool = [m for m in se.res_moves if life[m] == top]
+        note = " vida=%d" % top
+    best_v = max(vals[m] for m in pool)
     # Jogadas de valor parecido (dentro do teto) são decididas pelo progresso estratégico real.
     # Vitória/derrota forçada e empate por morte mútua nunca são mexidos: sobrevivência manda.
-    adj, cap = ({}, 0.0) if _terminal(best_v) else _root_adjustments(ctx, se, se.res_moves)
+    adj, cap = ({}, 0.0) if _terminal(best_v) else _root_adjustments(ctx, se, pool)
     scored = []
-    for m, v in zip(se.res_moves, se.res_vals):
+    for m in pool:
+        v = vals[m]
         bonus = adj.get(m, 0.0) if (v >= best_v - cap and not _terminal(v)) else 0.0
         scored.append((v + bonus, m))
     best_sc = max(sc for sc, _ in scored)
@@ -1402,9 +1767,11 @@ def _search_choice(ctx: Context, possible: list, started: float):
             key = evaluate_move(ctx, name).score if time.perf_counter() < guard else quick_score(ctx, name)
             if best_key is None or key > best_key:
                 pick, best_key = m, key
-    info = "busca d=%d nós=%d v=%.0f" % (se.max_depth, se.nodes, best_v)
+    info = "busca d=%d nós=%d v=%.0f%s" % (se.max_depth, se.nodes, best_v, note)
     if se.commit is not None:
         info += " comida=%s" % (se.commit,)
+    if surv and min(surv.values()) < K:
+        info += " solo=%s" % surv
     return MOVE_ORDER[pick], info
 
 
@@ -1448,15 +1815,26 @@ def get_move(state: GameState) -> MoveResponse:
         if len(possible) == 1:  # jogada única: nem precisa pensar
             return MoveResponse(move=possible[0])
 
+        surv = None
+        if len(ctx.enemies) == 1:  # 1v1: sobrevivência solo de cada jogada (3+ cobras: inalterado)
+            try:
+                surv = solo_survival(ctx, possible, started + SAFETY["ms"] / 1000.0)
+            except Exception:
+                logger.exception("MOVE %s: erro na checagem solo", state.turn)
+
         chosen, how = None, "pontos"
         if USE_SEARCH and len(ctx.enemies) == 1:  # 1v1: busca; com 3+ cobras vale a pontuação
             try:
-                chosen, how = _search_choice(ctx, possible, started)
+                chosen, how = _search_choice(ctx, possible, started, surv)
             except Exception:
                 logger.exception("MOVE %s: erro na busca, usando pontuação", state.turn)
                 chosen = None
         if chosen is None:
-            chosen, score = classic_choice(ctx, possible)
+            pool = possible
+            if surv:  # fallback do 1v1: a pontuação clássica só escolhe entre as que sobrevivem mais
+                bar = min(solo_horizon(ctx), max(surv.values()))
+                pool = [m for m in possible if surv[m] >= bar]
+            chosen, score = classic_choice(ctx, pool)
             how = "pontos %.1f" % score
 
         logger.info("MOVE %d [%s]: %s (%s, %.0f ms)", state.turn, ctx.phase, chosen, how,
